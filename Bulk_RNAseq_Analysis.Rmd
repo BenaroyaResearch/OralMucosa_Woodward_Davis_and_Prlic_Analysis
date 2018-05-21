@@ -1,0 +1,850 @@
+---
+title: "P85 Oral mucosa RNA-seq"
+author: "Hannah DeBerg"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+Project Summary
+------
+Project 85 examines sorted subsets of CD4 T cells from matched human oral mucosa and blood samples. From each patient, cells were sorted from the following subsets:
+ 
+* CD4+/CCR5+/CD69-, blood
+* CD4+/CCR5+/CD69-, mucosa
+* CD4+/CCR5+/CD69+, mucosa
+
+CD69 is a marker of resident memory T cells. CCR5 is a chemokine receptor that is used by HIV to enter T cells. In performing these experiments, the goal is to answer the following questions:
+
+1. How CD69- CD4 T cells in blood differ from those in tissue? 
+2. How do CD69- and CD69+ CD4 T cells in tissue differ?
+3. Does gene expression of cells in these subsets vary according to tissue inflammation? 
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+library(knitr)
+library(plyr)
+library(ggplot2); theme_set(theme_bw(20) + theme(panel.grid.major = element_blank(), 
+                                                 panel.grid.minor = element_blank()) +
+                              theme(legend.key = element_blank()))
+library(reshape)
+library(edgeR)
+library(limma)
+library(gplots)
+library(RColorBrewer) 
+library(ggthemes)
+library(ggbeeswarm)
+library(viridis)
+library(stringr)
+library(readxl)
+library(heatmap3)
+library(ggforce)
+#Load Matt's library which includes a function for making barcode plots
+library(geneSetTools)
+
+
+opts_chunk$set(fig.width=6, fig.height=4.25, cache = TRUE, echo=FALSE, warning=FALSE, message=FALSE)
+opts_knit$set(root.dir = "/Users/hannahdeberg/Box Sync/P85_Amanda_Prlic_OralMucosaCD4")
+setwd("/Users/hannahdeberg/Box Sync/P85_Amanda_Prlic_OralMucosaCD4")
+options(stringsAsFactors = FALSE)
+```
+
+```{r loading}
+
+#Read in library quality metrics
+metrics_85_7 <- read.csv("metrics/P85_7_HVHTMADXX_combined_metrics.csv")
+metrics_85_16 <- read.csv("metrics/P85-16_C8HAWANXX_160608_combined_metrics.csv")
+metrics_85 <- read.csv("metrics/P85Prlic_combined_summary-data.csv")  #Re processing of P85-12 and P85-18
+
+#metrics_85 has more columns than the other metrics file. This was compiled at a later data and includes a 
+#few additional parameters that are not crucial for examining library quality 
+
+# Code to examine whch metrics are present in 85, but not 85_17
+#colnames(metrics_85)[!(colnames(metrics_85) %in% colnames(metrics_85_7))]
+
+metrics <- Reduce(function(x, y) merge(x, y, all=TRUE), list(metrics_85_7, 
+                                                             metrics_85_16, 
+                                                             metrics_85))
+
+#Remove the flowcell name from the libID
+metrics$libid <- str_extract(metrics$libId, "lib[0-9]+")
+
+#Get annotation information 
+anno_85_7 <- read_xlsx("anno/P85-7_Final Annotation.xlsx", sheet=1)
+anno_85_12 <- read_xlsx("anno/P85-11_P85-12_Final Annotation.xlsx", sheet=1)
+anno_85_16 <- read_xlsx("anno/P85-16_Final Annotation.xlsx", sheet=1)
+anno_85_18 <- read_xlsx("anno/P85-18_Final Annotation.xlsx", sheet=1)
+
+#Remove the P85_11 libs from annotation
+anno_85_12 <- anno_85_12 %>% dplyr::filter(`Proj-Sub` == "P85-12")
+
+
+#Add a project column to each annotation file. Some anno files have sub project columns, but 
+#some have no indication of project
+anno_85_7$project <- "P85_7"
+anno_85_12$project <- "P85_12"
+anno_85_16$project <- "P85_16"
+anno_85_18$project <- "P85_18"
+
+clean_anno_names <- function(anno_df){
+  names(anno_df) <- names(anno_df) %>% 
+    str_to_lower() %>% # change variable names to lower case
+    str_replace_all(pattern = "\\.", replacement="_") %>% # remove periods
+    str_replace_all(pattern = " ", replacement = "_") %>% #remove blank spaces
+    make.unique(sep = "_") # de-dup variable names
+  
+  
+    if("library_sample_id" %in% names(anno_df)){
+        anno_df <- plyr::rename(anno_df, c("library_sample_id" = "libid"))
+    }
+  
+    if("library_sampleid" %in% names(anno_df)){
+        anno_df <- plyr::rename(anno_df, c("library_sampleid" = "libid"))
+    }
+  
+    if("library_id" %in% names(anno_df)){
+        anno_df <- plyr::rename(anno_df, c("library_id" = "libid"))
+    }
+  
+  return(anno_df)
+}
+
+anno_85_7 <- clean_anno_names(anno_85_7)
+anno_85_12 <- clean_anno_names(anno_85_12)
+anno_85_16 <- clean_anno_names(anno_85_16)
+anno_85_18 <- clean_anno_names(anno_85_18)
+
+anno_85_18$sample_id <- anno_85_18$fred_hutch_sample_id
+
+anno <- Reduce(function(x, y) merge(x, y, all=TRUE), list(anno_85_7,
+                                                          anno_85_12,
+                                                          anno_85_16,
+                                                          anno_85_18))
+
+#Remove MAIT anno
+anno <- anno[!str_detect(anno$sample_id, "MAIT"), ]
+
+#add fields to summarize sample type
+anno$tissue <- ifelse(str_detect(anno$tube_label, "B"), "blood",
+                      ifelse(str_detect(anno$tube_label, "M"), "mucosa", "other"))
+
+#remove frozen sample
+anno <- anno[!str_detect(anno$sample_description, "frozen"), ]
+
+#Remove "other" samples
+anno <- anno[!str_detect(anno$tissue, "other"), ]
+
+#Parse sample_id to get out CD69+/- info 
+anno$cd69expr <- ifelse(str_detect(anno$tube_label, "69-"), "CD69-",
+                        ifelse(str_detect(anno$tube_label, "69+"), "CD69+", "other"))
+
+#One of the blood samples is CD69+, this is odd. 
+#table(anno$cd69expr, anno$tissue)
+#anno$libid[which(anno$tissue== "blood" & anno$cd69expr == "CD69+")]
+#This is lib7438
+#This is listed as CD69- on a spreadsheet Amanda gave me, I'm going to assume it was a typo and put in the CD69- blood group. In the flow experiments, there were very, very few CD69+ cells observed in the blood, which further suggests this was a typo. 
+anno$cd69expr[which(anno$tissue== "blood" & anno$cd69expr == "CD69+")] <- "CD69-"
+
+#combine CD69expr and tissue into a single variable
+anno$sample <- paste0(anno$tissue, "_", anno$cd69expr)
+
+#Read in patient ID/lib ID conversion data 
+id_data <- read_xlsx("anno/patientID_libID_mapping.xlsx", sheet = 1)
+id_data$path_score <- as.numeric(id_data$path_score)
+
+anno <- merge(anno, id_data, by.x = "libid", by.y = "libid")
+
+#Read in counts
+counts_85_7 <- read.csv("counts/P85-7_HVHTMADXX_combined_counts.csv", row.names = 1)
+counts_85_16 <- read.csv("counts/P85-16_C8HAWANXX_160608_combined_counts.csv", row.names = 1)
+counts_85 <- read.csv("counts/P85Prlic_combined_counts.csv", row.names = 1)
+
+counts <- cbind(counts_85_7, 
+                counts_85_16,
+                counts_85)
+
+#Shorten libID in metrics and counts
+colnames(counts) <- str_extract(colnames(counts), "lib[0-9]+")
+
+#Merge annotation and metrics into a design data frame
+design <- merge(metrics, anno, by.x = "libid", by.y = "libid")
+
+#Remove the patient without tissue data (pt 48)
+design <- design[design$patient_id != 48, ]
+
+#Correct severity information for patient 19
+#This patient was originally scored a 3, but should be updated to 4
+design$path_score[design$patient_id == 19] <- 4
+
+#Make sure libraries in counts and metrics are in the same order
+#only keep counts for libs that are in design 
+lib_order <- match(design$libid, colnames(counts))
+counts <- counts[,lib_order]
+
+#Make patient id a factor
+design$patient_id <- as.factor(design$patient_id)
+
+```
+
+
+RNAseq Quality Metrics
+------
+Overall, the libraries in this project appear to be high quality. In performing quality control, the following three metrics are examined:
+
+1. The total number of reads in each library (libraries with less than 1 million reads are suspect).   
+2. The percent alignment of each library (higher is better)   
+3. Median CV coverage. This is the the median coefficient of variation of coverage of the 1000 most highly expressed transcripts. It measures read bias along the transcript. Ideally, this value would be 0.
+
+A histogram plotting the number of reads in P85 libraries is below. All libraries have at least 1 million reads.
+
+```{r set_up_qc_parameters, fig.width=4, fig.height=3}
+#Set QC cuts
+align_cut = 75
+total_reads_cut = 1
+median_cv_cut = 0.8
+
+#Get a colorblind palette
+cb_pal <- colorblind_pal()(8)
+cb_pal <- cb_pal[2:8]
+my_cb_pal <- colorRampPalette(cb_pal)(length(unique(design$patient_id)))
+```
+
+```{r qcplots_total_reads, fig.width=4, fig.height=3}
+ggplot(design, aes(x=fastq_total_reads/10^6)) + 
+  geom_histogram(color="black")+
+  labs(x = "number of reads (in millions)", y = "number of libraries")+
+  xlim(c(0,30))+
+  theme(text = element_text(size=12))
+```
+
+The plot below compares the median CV of coverage and the percent alignment of reads in each library. High quality libraries will fall in the upper left quadrant of the box (high percent alignment and low median CV coverage). All of the libraries in this project look good. There is one library from a CD69- tissue sample that is slightly lower quality than the others, however it still passes the cutoffs by a large amount. 
+
+```{r qcplots_coverage_vs_alignment, fig.width=5.5, fig.height=3, results='hide'}
+g <- ggplot(design, aes(x=MEDIAN_CV_COVERAGE, y=mapped_reads_w_dups*100, color=sample)) + 
+  geom_point(size=2, alpha=0.8) + 
+  scale_color_manual(values = c("red", "orange", "darkcyan"))+
+  labs(x = "median cv coverage", y = "percent alignment", color ="")+
+  geom_hline(yintercept =  align_cut)+
+  geom_vline(xintercept =  median_cv_cut)+
+  xlim(c(0,1))+
+  ylim(c(0,100))+
+  theme(text = element_text(size=12))
+
+print(g)
+
+pdf("QC_coverage_vs_alignment.pdf", height = 4, width = 6, useDingbats = F)
+print(g)
+invisible(dev.off())
+```
+
+```{r make_qc_cuts}
+design$qc_pass <- design$fastq_total_reads > total_reads_cut &
+                  design$mapped_reads_w_dups*100 > align_cut &
+                  design$MEDIAN_CV_COVERAGE < median_cv_cut
+                  
+
+design_qc <- design %>% dplyr::filter(qc_pass ==TRUE)
+counts_qc <- counts[,colnames(counts) %in% design_qc$libid]
+
+```
+
+```{r geneFiltering}
+#Get protein coding genes with HGNC symbols
+gene_key <- read.table("EnsembleToHGNC_GRCh38.txt", header = TRUE,sep = "\t",na.strings = "") 
+genes_hgnc <- gene_key[!is.na(gene_key$HGNC.symbol),]
+
+counts_hgnc <- counts_qc[rownames(counts_qc) %in% genes_hgnc$Ensembl.Gene.ID,]
+
+genes_pc <- subset(genes_hgnc, genes_hgnc$Gene.type == "protein_coding") #21119
+genes_pc <- genes_pc[!duplicated(genes_pc$Ensembl.Gene.ID),] #remove duplicated ensembl genes #21117
+counts_pc <- merge(genes_pc, counts_qc, by.x="Ensembl.Gene.ID", by.y ="row.names")
+gene_key_pc <- counts_pc[,1:3] #First three columns contain annotation information
+counts_pc <- counts_pc[,4:ncol(counts_pc),] #The remaining columns contain counts information 
+rownames(counts_pc) <- gene_key_pc[,1]
+
+#Define a function to filter out lowly expressed genes
+gene_filter <- function(counts_in, per_cutoff){
+  #Keep genes with cpm of at least one in at least per_cutoff fraction of libraries
+  #CPM normalize
+  counts_cpm_norm <- as.data.frame(t(t(counts_in*10^6)/colSums(counts_in)))
+  
+  #Filter out lowly expressed genes
+  keepRows <- rowSums((counts_cpm_norm) >= 1) >= per_cutoff*ncol(counts_cpm_norm)
+  counts_filtered <- counts_in[keepRows,]
+  
+  return(counts_filtered)
+  
+}
+
+#Run function to filter lowly expressed genes
+counts_all_filtered <- gene_filter(counts_hgnc, 0.10)
+counts_pc_filtered <- gene_filter(counts_pc, 0.10)
+
+normalize_counts <- function(counts_in, method){
+  #normalize using tmm or deconvolution
+  #tmm is good for bulk RNAseq
+  #deconvolution is best for large datasets of single cell RNAseq
+  #deconvolution is NOT recommended for smaller datasets (less than a few hundred cells)
+  
+  if(method == "decon"){
+  #Normalize using the deconvolution algorithm
+  decon_norm_factors <- computeSumFactors(as.matrix(counts_in))
+  counts_norm <- as.data.frame(t(t(counts_in)/decon_norm_factors))
+  }
+  
+  if(method == "tmm"){
+  #Normalize using the TMM algorithm 
+  dge <- DGEList(counts_in)
+  dge <- calcNormFactors(dge)
+  counts_norm <- cpm(dge, normalized.lib.sizes=TRUE)
+  }
+  
+  return(counts_norm)
+  
+}
+
+counts_pc_norm <- normalize_counts(counts_pc_filtered, "tmm")
+counts_all_norm <- normalize_counts(counts_all_filtered, "tmm")
+```
+
+Gene Filtering
+------
+A filter is applied to keep only genes with HGNC symbols that have been annotated as protein coding. This keeps `r nrow(genes_pc)` of 64345 genes. A second filter that selects genes with a count of at least one in 10% of libraries is also applied. This keeps `r nrow(counts_pc_filtered)` of the `r nrow(genes_pc)` genes from the first filter. The selected genes are normalized using the TMM (trimmed mean of M values) algorithm.
+
+Principal Component Analysis
+------
+Principal component analysis (PCA) is used to describe variation in a dataset. The goal is to take a dataset which depends on many different variables, some of which may be correlated and come up with a smaller set of variables that can be used to explain the data. PCA transforms the expression data (gene counts) into a set of linearly uncorrelated variables such that the first principal component (PC1) accounts for as much variation in the data as possible and subsequent principal components (PC2, PC3, etc) explain as much variation as possible under the condition that the they be uncorrelated with the first principal component. 
+
+In this dataset, PC1 is related to donor identity and PC2 reflects the source and cell subset. The following plot shows the separation of the data according to tissue source and CD69 surface expression. This suggests that there are differences in gene expression between cells from the different groups.
+
+The blood CD69- and mucosa CD69- libraries from subject 35 are an exception to the pattern of blood CD69- cells having lower PC2 scores than the other sample types. These two libraries are circled in the PCA plots below and are from donor 35. The deviation from the pattern seen in other samples suggests that samples could have been swapped. They will be removed from downstream analysis.
+
+```{r pca, cache=TRUE}
+#Run PCA on the normalized log2 transformed counts data
+pca = prcomp(log2(as.data.frame(t(counts_pc_norm))+1), center=TRUE, scale=FALSE)
+
+#Get PCA resutls and merge with sample information stored in metrics
+sum_pca = summary(pca)
+pca_scores= as.data.frame(pca$x)
+
+pdatscores <- merge(design_qc, pca_scores, by.x = "libid", by.y="row.names")
+pc1_lab = paste("PC1 (", round(100*sum_pca$importance[2, 1], 1),  "%)", sep="")
+pc2_lab = paste("PC2 (", round(100*sum_pca$importance[2, 2], 1),  "%)", sep="")
+pc3_lab = paste("PC3 (", round(100*sum_pca$importance[2, 3], 1),  "%)", sep="")
+```
+
+```{r pca_plots_pc1_pc2_by_sample, fig.width=5, fig.height=3}
+#Make a PCA plot, colored by project
+ggplot() + 
+  geom_circle(data = pdatscores[pdatscores$patient_id == 35 & pdatscores$sample != "mucosa_CD69+",], aes(x0=PC1, y0=PC2, r=10))+
+  geom_point(data = pdatscores, aes(x=PC1, y=PC2, color = sample),size=3) +
+  labs(x = pc1_lab, y = pc2_lab, color = "")+
+  scale_color_manual(values = c("red", "orange", "darkcyan"))+
+  theme(text = element_text(size=12))
+
+```
+
+The following plot examines the first two principal components according to donor identity. Samples from a donor tend to have similar PC1 values, suggesting that donor identity drives the variation captured by PC1. 
+
+```{r pca_plots_pc1_pc2_by_donor, fig.width=4.3, fig.height=3}
+#Make a PCA plot, colored by donor
+ggplot() + 
+   geom_circle(data = pdatscores[pdatscores$patient_id == 35 & pdatscores$sample != "mucosa_CD69+",], aes(x0=PC1, y0=PC2, r=10))+
+  geom_point(data=pdatscores, aes(x=PC1, y=PC2, color = as.factor(patient_id)), size=3) +
+  labs(x = pc1_lab, y = pc2_lab, color = "donor")+
+  scale_color_manual(values = my_cb_pal)+
+  theme(text = element_text(size=12))
+
+```
+
+```{r remove likely swapped samples from subject 35}
+#Remove samples from subject 35- the likely swap
+design <- design[!(design$patient_id == 35 & design$sample != "mucosa_CD69+"),]
+counts_all_norm <- counts_all_norm[,colnames(counts_all_norm) %in% design$libid]
+counts_pc_norm <- counts_pc_norm[,colnames(counts_pc_norm) %in% design$libid]
+```
+
+Differential Expression Analysis 1: Tissue vs blood
+------
+Gene expression was modelled as a function of the sample source (blood (CD69-), or tissue (CD69- and CD69+). 
+
+```{r DE_analysis_tissue_v_blood}
+
+#Set up a model for gene expression 
+design_mat <-  model.matrix(~design$tissue)
+vwts_blood_v_tissue <- voomWithQualityWeights(counts_pc_norm, design=design_mat, plot=F, span=0.1)
+
+#Include patient as a random effect
+# Build design matrix (not including the random effect)
+# estimate correlation among samples for the blocking variable
+corfit <-
+  duplicateCorrelation(vwts_blood_v_tissue,
+                       design=design_mat,
+                       block=design$patient_id)
+
+
+# fit model, including random effect 
+vfit_corfit <-
+  lmFit(vwts_blood_v_tissue,
+        block=design$patient_id,
+        correlation=corfit$consensus.correlation)
+vfit_corfit_eb <- eBayes(vfit_corfit)
+
+#Get mucosa vs blood DE genes
+top_genes_blood_tissue <-topTable (vfit_corfit_eb, coef = 2, number=Inf, sort.by="P")
+
+top_genes_blood_tissue$gene_name <- gene_key$HGNC.symbol[match(rownames(top_genes_blood_tissue), gene_key$Ensembl.Gene.ID)]
+
+top_genes_blood_tissue$gene_type <- gene_key$Gene.type[match(rownames(top_genes_blood_tissue), gene_key$Ensembl.Gene.ID)]
+
+#Define sig genes
+get_sig_genes <- function(top_genes,pCut, foldCut){
+  sig_genes = top_genes[top_genes$adj.P.Val<pCut & abs(top_genes$logFC) > foldCut, ]
+  return(sig_genes)
+} # end get_genes function
+
+#Get sig genes
+sig_genes_blood_tissue <- get_sig_genes(top_genes_blood_tissue, 0.05, 1)
+sig_genes_blood_tissue$EnsemblID <- rownames(sig_genes_blood_tissue, 0.05, 1)
+
+
+
+#write sig gene lists
+write.csv(sig_genes_blood_tissue[,c("gene_name", "logFC", "P.Value", "adj.P.Val", "gene_type", "EnsemblID")],
+          "Oral_mucosa_manuscript/Sig_genes_blood_vs_tissue.csv",
+          quote=FALSE, row.names = FALSE)
+
+```
+
+```{r heatmap_blood_v_tissue, fig.width=8, fig.height=9, results='hide'}
+#Get DE genes
+sig_counts_blood_tissue <- vwts_blood_v_tissue$E[rownames(vwts_blood_v_tissue$E)%in% rownames(sig_genes_blood_tissue),]
+
+sample_labs <-  ifelse (design$sample == "blood_CD69-", "red",
+                     ifelse(design$sample == "mucosa_CD69-", "orange",
+                            ifelse(design$sample == "mucosa_CD69+", "darkcyan",0)))
+
+path_colors <- viridis(4)
+path_labs <- path_colors[design$path_score]
+
+donor_colors <- data.frame("donor" = sort(unique(design$patient_id)), 
+                           "color" = my_cb_pal)
+donor_labs <- donor_colors$color[match(design$patient_id, donor_colors$donor)]
+
+row_labels <- gene_key$HGNC.symbol[match(rownames(sig_counts_blood_tissue), gene_key$Ensembl.Gene.ID)]
+
+#Set colors for heatmap
+my.col <- colorRampPalette(rev(brewer.pal(9, "RdBu")))(100)
+my.col <- colorRampPalette(c("darkblue", "white", "darkred"))(100)
+
+column_colors <- cbind("sample" = col2hex(sample_labs),
+                       "donor" = donor_labs,
+                       "severity" = col2hex(path_labs))
+
+#Order according to sample type
+library_order <- c(which(design$sample == "blood_CD69-"),
+                   which(design$sample == "mucosa_CD69-"), 
+                   which(design$sample == "mucosa_CD69+"))
+
+sig_counts_blood_tissue <- sig_counts_blood_tissue[,library_order]
+column_colors <- column_colors[library_order,]
+
+pdf("Oral_mucosa_manuscript/Heatmap_blood_v_all_tissue_sample_col_order.pdf", height=10, width = 8, useDingbats = F)
+
+heatmap3(as.matrix(sig_counts_blood_tissue), scale = "row",  Colv = NA,
+         ColSideColors = column_colors, col = my.col, margins = c(10,20),
+         labCol = rep("", ncol(sig_counts_blood_tissue)), 
+         labRow = rep("", nrow(sig_counts_blood_tissue)), cexRow = 1,
+         balanceColor = T)
+legend("topright", legend = c("blood, CD69-",
+                              "tissue, CD69-",
+                              "tissue, CD69+"), 
+       fill=c("red", "orange","darkcyan"),bty="n", cex=1, title = "") 
+
+legend("bottomright", legend = c("1","2","3","4"), 
+       fill=c(path_colors[1], path_colors[2],
+              path_colors[3], path_colors[4]),bty="n", cex=1, title = "severity")
+
+invisible(dev.off())
+
+
+pdf("Oral_mucosa_manuscript/Heatmap_blood_v_all_tissue_dendrogram_col_order.pdf", height=10, width = 8, useDingbats = F)
+
+heatmap3(as.matrix(sig_counts_blood_tissue), scale = "row", 
+         ColSideColors = column_colors, col = my.col, margins = c(10,20),
+         labCol = rep("", ncol(sig_counts_blood_tissue)), 
+         labRow = rep("", nrow(sig_counts_blood_tissue)), cexRow = 1,
+         balanceColor = T)
+legend("topright", legend = c("blood, CD69-",
+                              "tissue, CD69-",
+                              "tissue, CD69+"), 
+       fill=c("red", "orange","darkcyan"),bty="n", cex=1, title = "") 
+
+legend("bottomright", legend = c("1","2","3","4"), 
+       fill=c(path_colors[1], path_colors[2],
+              path_colors[3], path_colors[4]),bty="n", cex=1, title = "severity")
+
+invisible(dev.off())
+```
+
+Differential Expression Analysis 2: CD69+ vs CD69- in tissue 
+------
+Gene expression was modelled as a function of CD69 expression (positive or negative) in oral mucosa tissue samples. 
+
+```{r DE_analysis_tissue_cd69pos_v_tissue_cd69neg}
+
+#Subset to mucosa libraries only  
+design_mucosa <- design[design$tissue == "mucosa",]
+counts_mucosa <- counts_pc_norm[,design_mucosa$libid]
+
+#Set up a model for gene expression 
+design_mat_tissue <-  model.matrix(~design_mucosa$cd69expr)
+vwts_cd69_pos_v_neg <- voomWithQualityWeights(counts_mucosa, design=design_mat_tissue, plot=F, span=0.1)
+
+#Include patient as a random effect
+# Build design matrix (not including the random effect)
+# estimate correlation among samples for the blocking variable
+corfit <-
+  duplicateCorrelation(vwts_cd69_pos_v_neg,
+                       design=design_mat_tissue,
+                       block=design_mucosa$patient_id)
+
+
+# fit model, including random effect 
+vfit_corfit <-
+  lmFit(vwts_cd69_pos_v_neg,
+        block=design_mucosa$patient_id,
+        correlation=corfit$consensus.correlation)
+vfit_corfit_eb <- eBayes(vfit_corfit)
+
+#Get mucosa vs blood DE genes
+top_genes_cd69 <-topTable (vfit_corfit_eb, coef = 2, number=Inf, sort.by="P")
+
+top_genes_cd69$gene_name <- gene_key$HGNC.symbol[match(rownames(top_genes_cd69), gene_key$Ensembl.Gene.ID)]
+
+top_genes_cd69$gene_type <- gene_key$Gene.type[match(rownames(top_genes_cd69), gene_key$Ensembl.Gene.ID)]   
+ 
+#Get sig genes
+sig_genes_cd69 <- get_sig_genes(top_genes_cd69, 0.05, 1)    
+sig_genes_cd69$EnsemblID <- rownames(sig_genes_cd69, 0.05, 1)  
+ 
+#write sig gene lists
+write.csv(sig_genes_cd69[,c("gene_name", "logFC", "P.Value", "adj.P.Val", "gene_type", "EnsemblID")],
+          "Oral_mucosa_manuscript/Sig_genes_CD69_tissue_only.csv",
+          quote=FALSE, row.names = FALSE)
+
+```
+
+```{r heatmap_cd69, fig.width=8, fig.height=9, results='hide'}
+#Get DE genes
+sig_counts_cd69 <- vwts_cd69_pos_v_neg$E[rownames(vwts_cd69_pos_v_neg$E)%in% rownames(sig_genes_cd69),]
+
+sample_labs <-  ifelse(design_mucosa$cd69expr == "CD69-", "orange",
+                            ifelse(design_mucosa$cd69expr == "CD69+", "darkcyan",0))
+
+
+path_colors <- viridis(4)
+path_labs <- path_colors[design_mucosa$path_score]
+
+#Keep donor colors consistent with blood v tissue heatmap
+donor_colors <- data.frame("donor" = sort(unique(design$patient_id)), 
+                           "color" = my_cb_pal)
+donor_labs <- donor_colors$color[match(design_mucosa$patient_id, donor_colors$donor)]
+
+
+row_labels <- gene_key$HGNC.symbol[match(rownames(sig_counts_cd69), gene_key$Ensembl.Gene.ID)]
+
+#Set colors for heatmap
+my.col <- colorRampPalette(rev(brewer.pal(9, "RdBu")))(100)
+my.col <- colorRampPalette(c("darkblue", "white", "darkred"))(100)
+
+column_colors <- cbind("sample" = col2hex(sample_labs),
+                       "donor" = donor_labs,
+                       "severity" = col2hex(path_labs))
+
+#Order according to sample type
+library_order <- c(which(design_mucosa$cd69expr == "CD69-"),
+                   which(design_mucosa$cd69expr == "CD69+"))
+
+sig_counts_cd69 <- sig_counts_cd69[,library_order]
+column_colors <- column_colors[library_order,]
+
+pdf("Oral_mucosa_manuscript/Heatmap_cd69_sample_col_order.pdf", height=10, width = 8, useDingbats = F)
+
+heatmap3(as.matrix(sig_counts_cd69), scale = "row",  Colv = NA,
+         ColSideColors = column_colors, col = my.col, margins = c(10,20),
+         labCol = rep("", ncol(sig_counts_cd69)), 
+         labRow = row_labels, cexRow = 1,
+         balanceColor = T)
+legend("topright", legend = c("blood, CD69-",
+                              "tissue, CD69-",
+                              "tissue, CD69+"), 
+       fill=c("red", "orange","darkcyan"),bty="n", cex=1, title = "") 
+
+legend("bottomright", legend = c("1","2","3","4"), 
+       fill=c(path_colors[1], path_colors[2],
+              path_colors[3], path_colors[4]),bty="n", cex=1, title = "severity")
+
+invisible(dev.off())
+
+
+pdf("Oral_mucosa_manuscript/Heatmap_cd69_dendrogram_col_order.pdf", height=10, width = 8, useDingbats = F)
+
+heatmap3(as.matrix(sig_counts_cd69), scale = "row", 
+         ColSideColors = column_colors, col = my.col, margins = c(10,20),
+         labCol = rep("", ncol(sig_counts_cd69)), 
+         labRow = row_labels, cexRow = 1,
+         balanceColor = T)
+legend("topright", legend = c("blood, CD69-",
+                              "tissue, CD69-",
+                              "tissue, CD69+"), 
+       fill=c("red", "orange","darkcyan"),bty="n", cex=1, title = "") 
+
+legend("bottomright", legend = c("1","2","3","4"), 
+       fill=c(path_colors[1], path_colors[2],
+              path_colors[3], path_colors[4]),bty="n", cex=1, title = "severity")
+
+invisible(dev.off())
+```
+
+
+```{r volcano_cd69, fig.width=8, fig.height=9, results='hide'}
+fc_cutoff <- 1
+p_cutoff <- 0.05
+
+#Select genes to annotate on plot
+selected_genes <- c("IL17A", "IL17F", "IL26", "AHR")
+
+g <- ggplot(data = top_genes_cd69, aes(x=logFC, y=-log10(adj.P.Val), color = logFC>0)) +
+  geom_point(alpha=0.7, size=2.5, shape = 19) +
+  theme(legend.position = "none") +
+  scale_color_manual(values = c("orange","darkcyan"))+
+  xlab("log2 fold change, genes up in tissue CD69+\non right, genes up in tissue CD69- on left") + ylab("-log10 FDR")+
+  geom_vline(xintercept=fc_cutoff, color="black", linetype="dotted",size=1.0) +
+  geom_vline(xintercept=-1*fc_cutoff, color="black", linetype="dotted",size=1.0)+
+  geom_hline(yintercept=-log10(p_cutoff), color="black",linetype="dotted",size=1.0)+
+  geom_text(data = top_genes_cd69[top_genes_cd69$gene_name %in% selected_genes,],
+            aes(x=logFC, y=-log10(adj.P.Val),label=gene_name), 
+            size=2.5, vjust=1,hjust=0.5, color="black")+
+  theme(text = element_text(size=9))
+
+print(g)
+
+pdf("Oral_mucosa_manuscript/Volcano_plot_cd69pos_v_neg.pdf", height=4, width = 5, useDingbats = F)
+print(g)
+invisible(dev.off())
+```
+
+
+```{r gsea_for_farber_core_sig}
+#Write files for running GSEA using the Farber "core" signature to compare CD69+ tissue samples with CD69- tissue samples.
+
+farber_core_sig <- read.csv("Oral_mucosa_manuscript/GeneSetAnalysis/Kumar_Farber_core_signature.csv")
+farber_core_sig <- farber_core_sig[2:nrow(farber_core_sig),]
+
+#Write out GSEA counts file 
+lt_counts <- log2(counts_mucosa[,colnames(counts_mucosa) %in% design_mucosa$libid]+1)
+hgnc_lt_counts <- gene_key$HGNC.symbol[match(rownames(lt_counts), gene_key$Ensembl.Gene.ID)]
+hgnc_counts_filter <- !duplicated(hgnc_lt_counts)
+lt_counts <- lt_counts[hgnc_counts_filter,]
+hgnc_lt_counts <- hgnc_lt_counts[hgnc_counts_filter]
+rownames(lt_counts) <- hgnc_lt_counts
+
+write_GSEA_counts("Oral_mucosa_manuscript/GeneSetAnalysis/Trm_logcounts_for_GSEA.txt",lt_counts)
+#Write out GSEA continuous phenotype file
+write_cls("Oral_mucosa_manuscript/GeneSetAnalysis/mucosa_counts_", lt_counts,  design_mucosa, "cd69expr", "libid")
+
+#Write gmx file of gene set
+#Add annotation in first row
+cor_sig_genes <-c("core_sig","core_sig",farber_core_sig)
+write.table(cor_sig_genes, "Oral_mucosa_manuscript/GeneSetAnalysis/core_sig.gmx", quote=FALSE, sep="\t", row.names=FALSE, col.names=FALSE, na="")
+
+```
+
+Differential Expression Analysis 3: Gene expression across all mucosa samples (CD69+ and CD69-), treating pathology score as a continuous variable. 
+------
+For this analysis, the data was subset to all mucosa-derived samples. Gene expression was modeled as a continuous function of pathology score (1-4). Genes are considered differentially expressed if they have a FDR of less than 0.2. Differentially expressed genes are plotted in the following heatmap. 
+
+```{r DE_analysis_tissue_cd69pos_v_tissue_cd69neg}
+
+#Subset to mucosa libraries only  
+design_mucosa <- design[design$tissue == "mucosa",]
+counts_mucosa <- counts_pc_norm[,design_mucosa$libid]
+
+#Set up a model for gene expression 
+design_mat_path <-  model.matrix(~design_mucosa$path_score)
+vwts_path <- voomWithQualityWeights(counts_mucosa, design=design_mat_path, plot=F, span=0.1)
+
+#Include patient as a random effect
+# Build design matrix (not including the random effect)
+# estimate correlation among samples for the blocking variable
+# corfit <-
+#   duplicateCorrelation(vwts_path,
+#                        design=design_mat_path,
+#                        block=design_mucosa$patient_id)
+
+
+# fit model, including random effect 
+# vfit_corfit <-
+#   lmFit(vwts_path,
+#         block=design_mucosa$patient_id,
+#         correlation=corfit$consensus.correlation)
+# vfit_corfit_eb <- eBayes(vfit_corfit)
+
+#Get model fits - the cor fit doesn't converge, don't use it
+vfit <- lmFit(vwts_path, design = design_mat_path)
+vfit_eb <- eBayes(vfit)
+
+#Get mucosa vs blood DE genes
+top_genes_path <-topTable (vfit_eb, coef = 2, number=Inf, sort.by="P")
+
+top_genes_path$gene_name <- gene_key$HGNC.symbol[match(rownames(top_genes_path), gene_key$Ensembl.Gene.ID)]
+
+top_genes_path$gene_type <- gene_key$Gene.type[match(rownames(top_genes_path), gene_key$Ensembl.Gene.ID)]
+
+#Get sig genes
+sig_genes_path <- get_sig_genes(top_genes_path, 0.25, 0)    
+sig_genes_path$EnsemblID <- rownames(sig_genes_path, 0.25, 0)  
+ 
+#write sig gene lists
+write.csv(sig_genes_path[,c("gene_name", "logFC", "P.Value", "adj.P.Val", "gene_type", "EnsemblID")],
+          "Oral_mucosa_manuscript/Sig_genes_path.csv",
+          quote=FALSE, row.names = FALSE)
+
+```
+
+```{r heatmap_pathology}
+#Get gene expression for heatmap
+sig_counts_path <- vwts_path$E[rownames(vwts_path$E)%in% rownames(sig_genes_path),]
+
+sample_labs <-  ifelse (design_mucosa$sample == "blood_CD69-", "red",
+                     ifelse(design_mucosa$sample == "mucosa_CD69-", "orange",
+                            ifelse(design_mucosa$sample == "mucosa_CD69+", "darkcyan",0)))
+
+
+path_colors <- viridis(4)
+path_labs <- path_colors[design_mucosa$path_score]
+
+donor_colors <- data.frame("donor" = sort(unique(design$patient_id)), 
+                           "color" = my_cb_pal)
+donor_labs <- donor_colors$color[match(design_mucosa$patient_id, donor_colors$donor)]
+
+row_labels <- gene_key$HGNC.symbol[match(rownames(sig_counts_path), gene_key$Ensembl.Gene.ID)]
+
+#Set colors for heatmap
+my.col <- colorRampPalette(rev(brewer.pal(9, "RdBu")))(100)
+my.col <- colorRampPalette(c("darkblue", "white", "darkred"))(100)
+
+column_colors <- cbind("sample" = col2hex(sample_labs),
+                       "donor" = donor_labs,
+                       "severity" = col2hex(path_labs))
+
+#Order according to sample type
+# library_order <- c(which(design_tissue$sample == "blood_CD69-"),
+#                    which(design_tissue$sample == "mucosa_CD69-"), 
+#                    which(design_tissue$sample == "mucosa_CD69+"))
+
+#Order according to pathology score
+library_order <- order(design_mucosa$path_score)
+
+sig_counts_path <- sig_counts_path[,library_order]
+column_colors <- column_colors[library_order,]
+
+pdf("Oral_mucosa_manuscript/Heatmap_severity_FDR_25.pdf", height=10, width = 8, useDingbats = F)
+
+heatmap3(as.matrix(sig_counts_path), scale = "row", Colv = NA,
+         ColSideColors = column_colors, col = my.col, margins = c(10,20),
+         labCol = rep("", ncol(sig_counts_path)), 
+         labRow = row_labels, cexRow = 1,
+         balanceColor = T)
+legend("topright", legend = c("blood, CD69-",
+                              "tissue, CD69-",
+                              "tissue, CD69+"), 
+       fill=c("red", "orange","darkcyan"),bty="n", cex=1, title = "") 
+
+legend("bottomright", legend = c("1","2","3","4"), 
+       fill=c(path_colors[1], path_colors[2],
+              path_colors[3], path_colors[4]),bty="n", cex=1, title = "severity")
+
+invisible(dev.off())
+```
+
+```{r ind_de_genes_pathology}
+plot_gene_expr <- function(gene, design_in, counts_in, gene_key){
+  
+  design_in$gene <- counts_in[rownames(counts_in) == gene_key$Ensembl.Gene.ID[which(gene_key$HGNC.symbol==gene & gene_key$Gene.type == "protein_coding")],]
+  
+  g <- ggplot(design_in, aes(x=sample, y = gene))+
+    geom_quasirandom(size=3, color="black")+
+    #scale_color_manual(values =c ("darkmagenta", "darkorange2","darkcyan"), guide=F)+
+    labs(x="", y=paste0(gene, " expression,\n log2(counts+1)"), color="")+
+    scale_x_discrete(labels = c("blood_CD69-" = "Blood",
+                                "mucosa_CD69-" = "OM CD69-",
+                                "mucosa_CD69+" = "OM CD69+"))+
+    stat_summary(fun.y = mean, fun.ymin = mean, fun.ymax = mean,
+                 geom = "crossbar", width = 0.5, color="black")+
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+    theme(text = element_text(size=14))
+  
+  filename_g <- paste0("Oral_mucosa_manuscript/",gene,"_exp.pdf")
+  pdf(filename_g, width = 5, height=4, useDingbats = F)
+  print(g)
+  dev.off()
+  
+  return(g)
+  
+}
+
+
+plot_gene_expr("IFNG", design, log2(counts_pc_norm+1), gene_key)
+plot_gene_expr("IL17A", design, log2(counts_pc_norm+1), gene_key)
+plot_gene_expr("IL17F", design, log2(counts_pc_norm+1), gene_key)
+
+```
+
+```{r Three_group_model}
+
+#Set up a model for gene expression 
+design_mat <-  model.matrix(~design$sample)
+vwts_three_group <- voomWithQualityWeights(counts_pc_norm, design=design_mat, plot=F, span=0.1)
+
+#Include patient as a random effect
+# Build design matrix (not including the random effect)
+# estimate correlation among samples for the blocking variable
+corfit <-
+  duplicateCorrelation(vwts_three_group,
+                       design=design_mat,
+                       block=design$patient_id)
+
+
+# fit model, including random effect 
+vfit_corfit <-
+  lmFit(vwts_three_group,
+        block=design$patient_id,
+        correlation=corfit$consensus.correlation)
+vfit_corfit_eb <- eBayes(vfit_corfit)
+
+#Make contrasts
+# colnames(design_mat)
+# [1] "(Intercept)"               "design$samplemucosa_CD69-" "design$samplemucosa_CD69+"
+contrast_blood_v_om69neg <- c(0,1,0)
+contrast_blood_v_om69pos <- c(0,0,1)
+contrast_om69neg_v_om69pos <- c(0,1,-1)
+
+
+fit_contrast <- contrasts.fit(vfit_corfit_eb, contrast_blood_v_om69neg)
+fit_contrast <- eBayes(fit_contrast)
+top_blood_v_om69neg <-topTable (fit_contrast, coef = 1, number=Inf, sort.by="P")
+top_blood_v_om69neg$gene_name <- gene_key$HGNC.symbol[match(rownames(top_blood_v_om69neg), gene_key$Ensembl.Gene.ID)]
+
+fit_contrast <- contrasts.fit(vfit_corfit_eb, contrast_blood_v_om69pos)
+fit_contrast <- eBayes(fit_contrast)
+top_blood_v_om69pos <-topTable (fit_contrast, coef = 1, number=Inf, sort.by="P")
+top_blood_v_om69pos$gene_name <- gene_key$HGNC.symbol[match(rownames(top_blood_v_om69pos), gene_key$Ensembl.Gene.ID)]
+
+fit_contrast <- contrasts.fit(vfit_corfit_eb, contrast_om69neg_v_om69pos)
+fit_contrast <- eBayes(fit_contrast)
+top_om69neg_v_om69pos <-topTable (fit_contrast, coef = 1, number=Inf, sort.by="P")
+top_om69neg_v_om69pos$gene_name <- gene_key$HGNC.symbol[match(rownames(top_om69neg_v_om69pos), gene_key$Ensembl.Gene.ID)]
+
+```
+
+
