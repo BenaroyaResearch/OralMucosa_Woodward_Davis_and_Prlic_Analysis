@@ -1,0 +1,9 @@
+Sample,Estimated Number of Cells,Mean Reads per Cell,Median Genes per Cell,Number of Reads,Valid Barcodes,Reads Mapped Confidently to Transcriptome,Reads Mapped Confidently to Exonic Regions,Reads Mapped Confidently to Intronic Regions,Reads Mapped Confidently to Intergenic Regions,Reads Mapped Antisense to Gene,Sequencing Saturation,Q30 Bases in Barcode,Q30 Bases in RNA Read,Q30 Bases in Sample Index,Q30 Bases in UMI,Fraction Reads in Cells,Total Genes Detected,Median UMI Counts per Cell
+blood_CD4,965,"73,596",971,"71,020,626",97.60%,55.20%,58.60%,27.30%,3.70%,3.60%,91.50%,96.00%,77.00%,94.30%,96.40%,80.00%,"14,714","2,873"
+blood_CD4_CCR5pos_CD69neg,435,"85,741","1,006","37,297,558",97.80%,54.00%,57.40%,29.30%,3.70%,3.50%,93.00%,96.00%,77.00%,94.00%,96.40%,90.40%,"13,257","2,825"
+blood_CD4_IL7RAneg_CD25pos,41,"432,768",877,"17,743,505",97.40%,55.40%,58.90%,23.30%,3.60%,3.80%,98.00%,96.00%,75.30%,94.20%,96.40%,56.60%,"7,947","2,094"
+or_muc_CD4_CCR5neg,542,"94,847",388,"51,407,411",97.80%,57.20%,60.60%,27.40%,3.50%,3.60%,95.40%,96.00%,76.90%,92.60%,96.40%,56.60%,"12,596",787
+or_muc_CD4_CCR5pos,"1,519","112,441",441,"170,798,897",97.70%,51.70%,55.00%,31.70%,3.70%,3.60%,95.80%,96.10%,76.90%,95.30%,96.50%,63.10%,"15,312",850
+or_muc_CD4_CCR5pos_CD69neg,499,"101,482",345,"50,639,989",97.70%,50.90%,54.20%,32.50%,3.60%,3.50%,96.10%,96.00%,76.90%,95.60%,96.40%,62.30%,"12,141",660
+or_muc_CD4_CCR5pos_CD69pos,427,"131,466",530,"56,136,369",97.80%,51.30%,54.60%,32.10%,3.80%,3.60%,95.90%,96.10%,77.00%,94.80%,96.60%,67.30%,"12,852","1,066"
+or_muc_CD4_IL7RAneg_CD25pos,282,"29,603",707,"8,348,176",97.80%,57.50%,60.60%,27.00%,3.90%,3.60%,82.90%,96.30%,78.50%,95.20%,96.70%,91.80%,"13,331","2,099"
