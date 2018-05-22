@@ -1,0 +1,974 @@
+---
+title: "Analysis of 10X Genomics single-cell RNA-seq data from CD4 T cell subsets in blood and oral mucosal tissue"
+author: "Matt Dufort"
+date: "21 May 2018"
+output: html_document
+---
+
+This file includes analysis code and results for Woodward Davis et al., "A human TH17 population with a tissue-resident signature in healthy and inflamed oral mucosal tissues".
+
+
+Description of experiment
+------
+Multiple subsets of CD4+ T cells were isolated and sorted from blood and oral mucosal tissue, then sequenced with 10X Genomics single-cell RNA-seq. The goal of this analysis is to determine both differences between select populations and heterogeneity within populations, especially in the context of resident memory T cells (Trm) in blood vs. tissue.
+
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+### set up environment
+
+# set knitr options
+knitr::opts_chunk$set(
+  fig.width=6, fig.height=4.25, cache = TRUE,
+  echo=FALSE, warning=FALSE, message=FALSE)
+knitr::opts_knit$set(
+  root.dir =
+    # "~/or_muc_10X_data")
+    "~/Box Sync/Projects/Prlic_lab_10X_genomics_data/Prlic_lab_CD4s_2017_Nov/or_muc_10X_data")
+options(stringsAsFactors = FALSE)
+
+# load general packages
+library(data.table)
+library(tidyverse)
+theme_set(
+  theme_bw(20) +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(colour="black", fill=NA, size=1),
+      axis.text=element_text(colour="black"),
+      axis.ticks=element_line(colour="black")))
+
+# load analysis_specific packages
+library(jsonlite)
+library(cellrangerRkit)
+library(annotables) # available at github.com/stephenturner/annotables
+library(Seurat)
+
+# load custom functions (available at github.com/mjdufort)
+library(miscHelpers)
+library(R10Xtools)
+library(geneSetTools)
+
+# load magrittr last
+library(magrittr)
+
+```
+
+```{r set_up_palettes_and_labels}
+pop_labels <-
+  c("Blood Total CD4", "Blood CD4 CCR5+CD69-",
+    "OM CD4 CCR5-", "OM CD4 CCR5+",
+    "OM CD4 CCR5+CD69-", "OM CD4 CCR5+CD69+") %>%
+  setNames(
+    c("blood_CD4", "blood_CD4_CCR5pos_CD69neg",
+      "or_muc_CD4_CCR5neg", "or_muc_CD4_CCR5pos",
+      "or_muc_CD4_CCR5pos_CD69neg", "or_muc_CD4_CCR5pos_CD69pos"))
+
+pal.independent_pops <-
+  c("#E32037", "#8DC63F", "#00A79D", "#F7941D") %>%
+  setNames(c("blood_CD4_CCR5pos_CD69neg",
+             "or_muc_CD4_CCR5neg",
+             "or_muc_CD4_CCR5pos_CD69neg",
+             "or_muc_CD4_CCR5pos_CD69pos"))
+
+pal.all_pops <-
+  c("#8B3687", "#E32037", "#8DC63F", "#4C65AF", "#00A79D", "#F7941D") %>%
+  setNames(c("blood_CD4", "blood_CD4_CCR5pos_CD69neg",
+             "or_muc_CD4_CCR5neg", "or_muc_CD4_CCR5pos",
+             "or_muc_CD4_CCR5pos_CD69neg", "or_muc_CD4_CCR5pos_CD69pos"))
+```
+
+Sequencing quality checks
+------
+We first check the quality of the sequencing data by sample, to ensure that high-quality data was obtained for each sample.
+
+```{r read_QC_mkfastq, echo=FALSE, include=FALSE}
+
+## load and process QC data from cellranger mkfastq
+# read in QC data
+qc.mkfastq <-
+  read_json(
+    "mkfastq.qc_summary.json")
+
+# rearrange QC data
+sample_qc.mkfastq <-
+  reshape2::melt(qc.mkfastq$sample_qc) %>%
+  dplyr::rename(
+    sample=L1,
+    lane=L2,
+    metric=L3) %>%
+  tidyr::spread(key=metric, value=value) %>%
+  dplyr::filter(!str_detect(sample, "IL7RAneg_CD25pos")) %>%
+  arrange(sample, lane)
+
+sample_qc.mkfastq$sample <-
+  factor(sample_qc.mkfastq$sample,
+         levels=sort(unique(sample_qc.mkfastq$sample)))
+```
+
+```{r plot_QC_mkfastq, fig.width=7, fig.height=4}
+### output plots of QC from mkfastq
+
+# plot total reads by sample by lane
+ggplot(
+  sample_qc.mkfastq[sample_qc.mkfastq$lane %nin% "all",],
+  mapping=aes(
+    x=lane,
+    y=ordered(sample, levels=rev(levels(sample))))) +
+  labs(x="Lane", y="Sample") +
+  scale_y_discrete(
+    labels=
+      pop_labels[rev(levels(sample_qc.mkfastq$sample))]) +
+  geom_tile(mapping=aes(fill=number_reads), color="white") +
+  scale_fill_gradient("Total\nreads", low="red", high="blue") +
+  theme(axis.text.y = element_text(size=rel(0.6)))
+
+# plot mean barcode Q score by sample by lane
+ggplot(
+  sample_qc.mkfastq[sample_qc.mkfastq$lane %nin% "all",],
+  mapping=aes(
+    x=lane,
+    y=ordered(sample, levels=rev(levels(sample))))) +
+  labs(x="Lane", y="Sample") +
+  scale_y_discrete(
+    labels=
+      pop_labels[rev(levels(sample_qc.mkfastq$sample))]) +
+  geom_tile(mapping=aes(fill=mean_barcode_qscore), color="white") +
+  scale_fill_gradient("Barcode\nquality\nscore", low="red", high="blue") +
+  theme(axis.text.y = element_text(size=rel(0.6)))
+# lane 5 look a little worse, but the differences are tiny
+
+# plot read 2 barcode Q30 base ratio by sample by lane
+ggplot(
+  sample_qc.mkfastq[sample_qc.mkfastq$lane %nin% "all",],
+  mapping=aes(
+    x=lane,
+    y=ordered(sample, levels=rev(levels(sample))))) +
+  labs(x="Lane", y="Sample") +
+  scale_y_discrete(
+    labels=
+      pop_labels[rev(levels(sample_qc.mkfastq$sample))]) +
+  geom_tile(mapping=aes(fill=read2_q30_base_ratio), color="white") +
+  scale_fill_gradient("Read 2\nbases\ngood", low="red", high="blue") +
+  theme(axis.text.y = element_text(size=rel(0.6)))
+
+
+```
+
+Based on the plots above, the variation in quality is small, and all samples yielded some amount of high-quality data across all lanes. This gives us more confidence moving forward with analyses.
+
+
+Cell barcodes and alignment quality checks
+------
+We now turn to the next step in the data processing - assigning reads to barcodes (cells), aligning reads to the genome, and counting transcripts based on unique molecular identifiers (UMIs).
+
+The table below shows, for each sample, the target number of cells, the total number of cells with usable data, and the percentage of the target actually recovered.
+
+
+```{r load_QC_count_by_sample}
+### load QC from cellranger count for each sample
+
+# load QC data
+sample_qc.count_by_sample <-
+  read.csv(
+    "metrics_summary.count_by_sample.csv",
+    colClasses="character") %>% # need to read as character due to %
+  standardize_dimnames() %>%
+  dplyr::filter(!str_detect(sample, "IL7RAneg_CD25pos"))
+
+# convert numeric columns, removing commas and converting percentages to proportions
+for (i in 2:ncol(sample_qc.count_by_sample)) {
+  if (any(str_detect(sample_qc.count_by_sample[,i], "%"))) {
+    sample_qc.count_by_sample[,i] <-
+      as.numeric(str_replace_all(sample_qc.count_by_sample[,i], "%", "")) / 100
+  } else if (any(str_detect(sample_qc.count_by_sample[,i], ","))) {
+    sample_qc.count_by_sample[,i] <-
+      as.numeric(str_replace_all(sample_qc.count_by_sample[,i], ",", ""))
+  } else sample_qc.count_by_sample[,i] <- as.numeric(sample_qc.count_by_sample[,i])}
+
+# define target numbers of cells
+target_cell_counts <-
+  c(4000,3000,4000,4000,4000,4000) %>%
+  setNames(
+    c("blood_CD4", "blood_CD4_CCR5pos_CD69neg",
+      "or_muc_CD4_CCR5neg", "or_muc_CD4_CCR5pos",
+      "or_muc_CD4_CCR5pos_CD69neg", "or_muc_CD4_CCR5pos_CD69pos"))
+
+# calculate number detected as a percentage of target number
+cells_detected_as_percent_of_target <-
+  sample_qc.count_by_sample$estimated_number_of_cells /
+  target_cell_counts[sample_qc.count_by_sample$sample] * 100
+
+print(
+  data.frame(
+    target=target_cell_counts,
+    recovered=sample_qc.count_by_sample$estimated_number_of_cells,
+    percent_of_target=round(cells_detected_as_percent_of_target,1)) %>%
+    set_rownames(pop_labels[rownames(.)]))
+```
+
+Cells vs. background
+------
+The numbers above use the 10X software's built-in method for determining cells vs. background. In this dataset, that algorithm appeared to work well. Each sample had a fairly clear boundary between barcodes with many reads, corresponding to cells, and barcodes with few reads, corresponding to droplets without a cell (per the summary .html files). We therefore use those automated calls, and conduct downstream analyses on the data filtered to barcodes called as cells by Cell Ranger.
+
+```{r load_filtered_aggregated_gene_bc_matrices, results="hide"}
+### load filtered gene_barcode matrices for aggregated samples
+## use versions without normalization, to use custom normalization downstream
+
+# load filtered gene-barcode matrix
+gene_bc_matrix.aggr.final <-
+  load_cellranger_matrix_h5(
+    pipestance_path=
+      "prlic_cd4s_ex_tregs_aggr_no_normalization",
+    barcode_filtered=TRUE)
+
+# load molecule_info, and add it to gene-barcode matrix
+gene_bc_matrix.aggr.final <-
+  load_molecule_info_from_path(
+    gbm=gene_bc_matrix.aggr.final,
+    f_path=
+      paste0(gene_bc_matrix.aggr.final@pipestance_path,
+             "/outs/filtered_molecules.h5"))
+
+## pull in aggregation sheet so I can use it downstream
+sample_aggr.final <- 
+  read.csv(
+    paste0(gene_bc_matrix.aggr.final@pipestance_path,
+           "/outs/aggregation_csv.csv"))
+```
+
+
+Sequencing Saturation
+------
+It is important that libraries are sequenced to sufficient depth to adequately capture the mRNA actually present in the cell. We can visualize this by estimating the number of genes or total transcripts that would have been detected if the samples had been sequenced with less depth. These curves should flatten out as the number of reads increases, and we want the actual amount of reads sequenced (the right end of these curves) to be on the flatter portion of the curve. If the curves are still increasing rapidly when we reach the actual number of reads sequenced, additional sequencing would have provided substantially more information.
+
+```{r estimate_saturation, results="hide"}
+### make saturation plots of UMIs or genes by reads
+## do this from gene_bc_matrix.aggr.final (the filtered, aggregated data, within each sample)
+
+# this gets at how many UMIs or genes are detected given a certain number of reads,
+# focusing only on barcodes called as cells
+
+## run for all aggregated samples
+# loop over each sample, running saturation estimation on each
+saturation.aggr.final <- list()
+for (i in sort(as.numeric(unique(gene_bc_matrix.aggr.final@molecule_info$gem_group)))) {
+  saturation.aggr.final[[as.character(i)]] <-
+    estimate_10X_saturation(
+      gene_bc_matrix.aggr.final@molecule_info[
+        gene_bc_matrix.aggr.final@molecule_info$gem_group == i,],
+      depths=10, nreps=3,
+      verbose=FALSE)
+}
+
+# condense saturation into a data frame
+saturation.merged.aggr.final <- data.frame()
+for (i in names(saturation.aggr.final)) {
+  saturation.aggr.final[[i]]$sample <- as.numeric(i)
+}
+saturation.merged.aggr.final <-
+  rbindlist(saturation.aggr.final)
+
+```
+
+The plots below focus on the sequence data per cell. They show the detection of UMIs (unique transcripts) or distinct genes in each cell, given a certain level of sequencing depth per cell These curves can be used to determine if the cells in each sample were sequenced to sufficient depth.
+
+```{r saturation_plots, fig.width=10, fig.height=6}
+
+# update saturation data frames to include sample name in addition to number
+saturation.merged.aggr.final$sample_num <-
+  saturation.merged.aggr.final$sample
+saturation.merged.aggr.final$sample <-
+  sample_aggr.final$library_id[
+    saturation.merged.aggr.final$sample_num]
+
+## mean UMIs per cell vs. mean reads per cell
+# shows how well the transcripts are covered given read depth per cell
+ggplot(
+  saturation.merged.aggr.final,
+  mapping=aes(
+    x=depth/n_barcodes, y=umis/n_barcodes,
+    color=as.factor(sample))) +
+  geom_line() + geom_point() +
+  scale_color_manual("Sample", values=pal.all_pops, labels=pop_labels) +
+  labs(x="Reads mapped per cell",
+       y="Mean UMIs per cell") +
+  theme(legend.text=element_text(size=rel(0.6)))
+
+## mean genes per cell vs. mean reads per cell
+# shows how well the cells in each sample are covered
+ggplot(
+  saturation.merged.aggr.final,
+  mapping=aes(
+    x=depth/n_barcodes, y=genes/n_barcodes,
+    color=as.factor(sample))) +
+  geom_line() + geom_point() +
+  scale_color_manual("Sample", values=pal.all_pops, labels=pop_labels) +
+  labs(x="Reads mapped per cell",
+       y="Mean genes per cell") +
+  theme(legend.text=element_text(size=rel(0.6)))
+
+```
+
+In this case, the curves for all samples appear to plateau before they terminate, suggesting that additional sequencing is not needed, and that the data can reasonably be compared across samples. Note that the saturation is more complete for the samples with fewer cells, as the additional reads per cell mean that any transcripts that were captured were very likely to be sequenced.
+
+These plots also show that the cells from blood have more transcripts and genes detected than the cells from oral mucosa. We will account for this variation in downstream analyses.
+
+```{r simplify_counts_annotation}
+## create a simplified count matrix and an annotation data frame
+
+# extract counts matrix from GeneBCMatrix object
+counts.aggr.final <-
+  as.matrix(gene_bc_matrix.aggr.final@assayData$exprs)
+
+# drop genes with 0 counts, as they mess up the PCA and provide no information
+counts.aggr.final <-
+  counts.aggr.final[rowSums(counts.aggr.final) > 0,]
+
+## create annotation object
+cell_annotation.aggr.final <-
+  data.frame(
+    cell_barcode = colnames(counts.aggr.final),
+    sample_num = as.numeric(str_extract(colnames(counts.aggr.final), "[0-9]+$")))
+
+# pull in additional information from sample aggregation sheet (read in above)
+cell_annotation.aggr.final <-
+  cbind(cell_annotation.aggr.final,
+        sample_aggr.final[cell_annotation.aggr.final$sample_num, -2])
+
+# calculate total UMIs and total genes detected in each cell
+cell_annotation.aggr.final$total_umis <-
+  colSums(counts.aggr.final)[
+    match(cell_annotation.aggr.final$cell_barcode,
+          colnames(counts.aggr.final))]
+cell_annotation.aggr.final$cell_detect_rate <-
+  colSums(counts.aggr.final > 0)[
+    match(cell_annotation.aggr.final$cell_barcode,
+          colnames(counts.aggr.final))]
+
+```
+
+```{r define_gene_sets}
+## define gene sets (Trm, Th17, etc.) for downstream use
+
+gene_set.farber_core_Trm <-
+  c("CA10", "CRTAM", "CX3CR1", "CXCL13", "CXCR6", "DUSP6", "FAM65B", "IL10", "IL2", "IL23R",
+    "ITGA1", "ITGAE", "KCNK5", "KLF2", "KLF3", "KRT72", "KRT73", "NPDC1", "PDCD1", "PTGDS",
+    "RAP1GAP2", "RGS1", "S1PR1", "SBK1", "SELL", "SOX13", "STK38", "TSPAN18", "TTC16", "TTYH2")
+gene_set.farber_core_Trm[gene_set.farber_core_Trm=="FAM65B"] <- "RIPOR2"
+
+gene_set.farber_core_Trm.df <-
+  data.frame(
+    symbol=gene_set.farber_core_Trm)  %>%
+  mutate(ensgene=grch38$ensgene[match(symbol, grch38$symbol)])
+
+gene_set.farber_core_Trm.df$direction <-
+  factor(NA, levels=c("up", "down"))
+gene_set.farber_core_Trm.df$direction[
+  gene_set.farber_core_Trm.df$symbol %in%
+    c("CA10", "ITGA1", "ITGAE", "IL2", "IL10", "CXCR6", "CXCL13",
+      "KCNK5", "RGS1", "CRTAM", "DUSP6", "PDCD1", "IL23R")] <-
+  "up"
+gene_set.farber_core_Trm.df$direction[
+  gene_set.farber_core_Trm.df$symbol %in%
+    c("STK38", "TTC16", "SELL", "KLF3", "KLF2", "D4S234E", "SBK1", "RIPOR2", "TTYH2",
+      "NPDC1", "KRT72", "S1PR1", "SOX13", "KRT73", "TSPAN18", "PTGDS", "RAP1GAP2", "CX3CR1")] <-
+  "down"
+
+gene_set.Th17.df <-
+  data.frame(
+    symbol=c("IL17A", "IL17F", "IL23R", "RORC",
+             "CCL20", "CCR6", "RORA", "IL22", "IL26", "AHR")) %>%
+  mutate(ensgene=grch38$ensgene[match(symbol, grch38$symbol)])
+
+# generate list of gene set data frames, each with ensgene and symbol column
+# name list elements with the gene set name for easier access and iteration over gene sets
+gene_sets_list <- list()
+gene_sets_list[["farber_core_Trm"]] <-
+  gene_set.farber_core_Trm.df[,c("symbol", "ensgene")]
+gene_sets_list[["farber_core_Trm.up"]] <-
+  gene_set.farber_core_Trm.df[
+    gene_set.farber_core_Trm.df$direction %in% "up",
+    c("symbol", "ensgene")]
+gene_sets_list[["farber_core_Trm.down"]] <-
+  gene_set.farber_core_Trm.df[
+    gene_set.farber_core_Trm.df$direction %in% "down",
+    c("symbol", "ensgene")]
+gene_sets_list[["Th17"]] <-
+  gene_set.Th17.df[,c("symbol", "ensgene")]
+```
+
+Normalization of counts
+-----
+In order to compare cells, we first need to normalize the counts across cells so that we are not mistaking differences in sequencing depth for differences in gene expression. With single cell RNA-seq data, there is the additional problem of gene dropout, where genes that are actually expressed in cells may not be detected due to variation in the efficiency of mRNA capture and sequencing.
+
+In this case, we normalize the total UMIs, then calculate the log UMI count per gene in each cell. Following this normalization, we remove variation explained by two common single-cell RNA-seq quality measures: the total UMIs per cell, and the percent of reads per cell that have mitochondrial origin.
+
+```{r remove_low_count_cells}
+## subset cells to exclude those with <1200 total UMI counts, based on plots of total UMIs
+cells_to_keep.tmp <-
+  colnames(counts.aggr.final)[
+    colSums(counts.aggr.final) >= 1200]
+counts.aggr.final.ex_low_count_cells <-
+  counts.aggr.final[
+    , match(cells_to_keep.tmp, colnames(counts.aggr.final))]
+counts.aggr.final.ex_low_count_cells <- # and remove 0-count genes again
+  counts.aggr.final.ex_low_count_cells[
+    rowSums(counts.aggr.final.ex_low_count_cells) > 0,]
+cell_annotation.aggr.final.ex_low_count_cells <-
+  cell_annotation.aggr.final[
+    match(cells_to_keep.tmp,
+          cell_annotation.aggr.final$cell_barcode), ]
+```
+
+```{r normalize_scale_data, results="hide"}
+
+# create Seurat object using all cells with substantial counts
+seurat_data.final.ex_low_count_cells <-
+  CreateSeuratObject(
+    raw.data=counts.aggr.final.ex_low_count_cells,
+    min.cells=3,
+    min.genes=200,
+    project="all_pops.ex_low_count_cells",
+    meta.data=  # include cell annotation metadata
+      data.frame(
+        cell_annotation.aggr.final[
+          , c("sample_num", "library_id", "source", "cell_type")],
+        row.names=cell_annotation.aggr.final[,1]))
+
+# calculate % of UMIs that are mitochondrial genes
+mito.genes.tmp <-
+  grep(
+    "^MT-",
+    grch38$symbol[
+      match(rownames(seurat_data.final.ex_low_count_cells@data),
+            grch38$ensgene)])
+percent.mito.tmp <-
+  Matrix::colSums(
+    seurat_data.final.ex_low_count_cells@raw.data[mito.genes.tmp, ]) /
+  Matrix::colSums(seurat_data.final.ex_low_count_cells@raw.data)
+
+# add mitochondrial read % to metadata
+seurat_data.final.ex_low_count_cells <-
+  AddMetaData(
+    object = seurat_data.final.ex_low_count_cells,
+    metadata = percent.mito.tmp,
+    col.name = "percent.mito")
+
+# filter cells to exclude those with high % mito reads and/or high UMIs
+# thresholds set based on inspection of distributions
+seurat_data.final.ex_low_count_cells.ex_outlier_cells <-
+  FilterCells(
+    seurat_data.final.ex_low_count_cells,
+    subset.names=c("percent.mito", "nGene", "nUMI"),
+    high.thresholds=c(0.1, 1800, 6500))
+
+# normalize data using simple logNormalize
+seurat_data.final.ex_low_count_cells.ex_outlier_cells <-
+  NormalizeData(
+    object = seurat_data.final.ex_low_count_cells.ex_outlier_cells,
+    normalization.method = "LogNormalize")
+
+# find variable genes
+seurat_data.final.ex_low_count_cells.ex_outlier_cells <-
+  FindVariableGenes(
+    object = seurat_data.final.ex_low_count_cells.ex_outlier_cells,
+    mean.function = ExpMean,
+    dispersion.function = LogVMR,
+    x.low.cutoff = 0.1,
+    x.high.cutoff = 10,
+    y.cutoff = 0.5,
+    do.plot=FALSE)
+# how many variable genes
+length(seurat_data.final.ex_low_count_cells.ex_outlier_cells@var.genes)
+# 1030 variable genes with the cutoffs above
+
+# scale data, and regress out nUMI and percent.mito
+seurat_data.final.ex_low_count_cells.ex_outlier_cells <-
+  ScaleData(
+    object = seurat_data.final.ex_low_count_cells.ex_outlier_cells,
+    vars.to.regress = c("nUMI", "percent.mito"))
+```
+
+```{r calculate_gene_set_summaries}
+## calculate gene set summaries, and store them in annotation
+gene_set_summaries.final.ex_low_count_cells.ex_outlier_cells <-
+  data.frame(
+    row.names=colnames(seurat_data.final.ex_low_count_cells.ex_outlier_cells@scale.data))
+
+for (i in names(gene_sets_list)) {
+  gene_set_summaries.final.ex_low_count_cells.ex_outlier_cells[
+    ,paste("mean", i, "seurat_scaled", sep=".")] <-
+    gene_set_count_summary(
+      counts=seurat_data.final.ex_low_count_cells.ex_outlier_cells@scale.data,
+      gene_set=gene_sets_list[[i]]$ensgene,
+      summary_function=mean,
+      remove_low_count_genes=FALSE)
+}
+
+seurat_data.final.ex_low_count_cells.ex_outlier_cells <-
+  AddMetaData(
+    seurat_data.final.ex_low_count_cells.ex_outlier_cells,
+    gene_set_summaries.final.ex_low_count_cells.ex_outlier_cells)
+```
+
+Visualizing variation: tSNE (of principal components)
+------
+We can reduce the dimensionality of the data to visualize broad variation among cells from the different samples. To do this, we use t-distributed stochastic neighbor embedding (tSNE) to project the data into two dimensions. In this case, we run tSNE on an already reduced set of the data, the principal component (PC) axes that capture the most variation among the samples.
+
+To do this, we must first determine which PCs to include. The plot below shows the expression of 
+
+```{r determine_relevant_PCs}
+## determine number of PCs to include downstream
+
+# run PCA on variable genes
+seurat_data.final.ex_low_count_cells.ex_outlier_cells <-
+  RunPCA(
+    object = seurat_data.final.ex_low_count_cells.ex_outlier_cells,
+    pc.genes = seurat_data.final.ex_low_count_cells.ex_outlier_cells@var.genes,
+    do.print = FALSE)
+
+# calculate correlations of genes to PCs
+seurat_data.final.ex_low_count_cells.ex_outlier_cells <-
+  ProjectPCA(
+    object = seurat_data.final.ex_low_count_cells.ex_outlier_cells,
+    do.print = FALSE)
+```
+
+The plot below shows how well each of the first 20 PCs separates the cells. It appears that the first 10-12 PCs capture substantial variation among the cells.
+
+```{r plot_PCHeatmap, fig.width=6, fig.height=8}
+# plot heatmaps
+PCHeatmap(
+  object = seurat_data.final.ex_low_count_cells.ex_outlier_cells,
+  pc.use = 1:20, cells.use = 500,
+  do.balanced = TRUE, label.columns = FALSE, use.full = FALSE)
+```
+
+The plot below is another way to visualize the variation captured by each PC. Again, it looks like the first 10-12 PCs capture the most variation in these data. We use PCs 1-10 going forward.
+
+```{r plot_PC_elbox_plot}
+# PCA elbow plot
+PCElbowPlot(
+  object = seurat_data.final.ex_low_count_cells.ex_outlier_cells,
+  num.pc=)
+
+PCs_to_use.all_pops <- 1:10
+
+```
+
+The plot below shows the resulting tSNE projection. Each point is a cell, and points are colored by their cellular population of origin.
+
+```{r run_tSNE}
+# run tSNE on the PCA data
+seurat_data.final.ex_low_count_cells.ex_outlier_cells <-
+  RunTSNE(
+    object = seurat_data.final.ex_low_count_cells.ex_outlier_cells,
+    dims.use = PCs_to_use.all_pops,
+    do.fast = TRUE,
+    check_duplicates=FALSE)
+```
+
+```{r plot_tSNE, fig.width=8, fig.height=6, results="hide"}
+
+# plot tSNE results, colored by cell population
+ggplot(
+  mapping=aes(
+    x=seurat_data.final.ex_low_count_cells.ex_outlier_cells@dr$tsne@cell.embeddings[,"tSNE_1"],
+    y=seurat_data.final.ex_low_count_cells.ex_outlier_cells@dr$tsne@cell.embeddings[,"tSNE_2"],
+    color=seurat_data.final.ex_low_count_cells.ex_outlier_cells@meta.data$library_id)) +
+  geom_point(alpha=0.8, size=2) +
+  scale_color_manual("Population", values=pal.all_pops, labels=pop_labels) +
+  labs(x="tSNE 1", y="tSNE 2")
+
+# output plot of tSNE results to file (colored by cell population)
+pdf(
+  paste0(
+    "tSNE_",
+    max(seurat_data.final.ex_low_count_cells.ex_outlier_cells@calc.params$RunTSNE$dims.use), "_PCs.",
+    "seurat_data.final.ex_low_count_cells.ex_outlier_cells.colored_by_sample.pdf"),
+  w=10, h=7)
+ggplot(
+  mapping=aes(
+    x=seurat_data.final.ex_low_count_cells.ex_outlier_cells@dr$tsne@cell.embeddings[,"tSNE_1"],
+    y=seurat_data.final.ex_low_count_cells.ex_outlier_cells@dr$tsne@cell.embeddings[,"tSNE_2"],
+    color=seurat_data.final.ex_low_count_cells.ex_outlier_cells@meta.data$library_id)) +
+  geom_point(alpha=0.8, size=3) +
+  scale_color_manual(
+    "Population",
+    values=pal.all_pops,
+    labels=pop_labels) +
+  labs(x="tSNE 1", y="tSNE 2")
+dev.off()
+
+```
+
+Differential gene expression analyses
+------
+To determine genes that are most differentially expressed (DE) between the cell types, we can use linear models to compare the expression of each gene.  We will use MAST, which incorporates a hurdle model tailored to single-cell gene expression data.  For all the comparisons, we will include the number of genes detected in the cell as a covariate, as those differences in the level transcriptional activity can mask underlying biological differences.
+
+For these analyses, we exclude two broader cell populations that contain other populations from which we have data. Inclusion of both these "parent" populations and their component populations would make differential expression comparisons difficult to interpret.
+
+```{r normalize_data_independent_populations, results="hide"}
+## we need to re-normalize the data using only the non-overlapping populations
+# define populations to include
+pops_to_use.tmp <-
+  c("blood_CD4_CCR5pos_CD69neg", "or_muc_CD4_CCR5neg",
+    "or_muc_CD4_CCR5pos_CD69neg", "or_muc_CD4_CCR5pos_CD69pos")
+
+# create Seurat object using cells from independent populations
+seurat_data.final.independent_pops.ex_low_count_cells <-
+  CreateSeuratObject(
+    raw.data=
+      counts.aggr.final.ex_low_count_cells[
+        , match(
+          cell_annotation.aggr.final.ex_low_count_cells$cell_barcode[
+            cell_annotation.aggr.final.ex_low_count_cells$library_id %in% pops_to_use.tmp],
+          colnames(counts.aggr.final.ex_low_count_cells))],
+    min.cells=3,
+    min.genes=200,
+    project="prlic_cd4s_independent_pops.ex_low_count_cells",
+    meta.data=  # include cell annotation metadata
+      data.frame(
+        cell_annotation.aggr.final.ex_low_count_cells[
+          , c("sample_num", "library_id", "source", "cell_type")],
+        row.names=cell_annotation.aggr.final.ex_low_count_cells[,"cell_barcode"])[
+          cell_annotation.aggr.final.ex_low_count_cells$library_id %in% pops_to_use.tmp,])
+# 983 cells, 12018 genes
+
+# calculate % of UMIs that are mitochondrial genes
+mito.genes.tmp <-
+  grep(
+    "^MT-",
+    grch38$symbol[
+      match(rownames(seurat_data.final.independent_pops.ex_low_count_cells@data),
+            grch38$ensgene)])
+percent.mito.tmp <-
+  Matrix::colSums(
+    seurat_data.final.independent_pops.ex_low_count_cells@raw.data[mito.genes.tmp, ]) /
+  Matrix::colSums(seurat_data.final.independent_pops.ex_low_count_cells@raw.data)
+
+# add mitochondrial read % to metadata
+seurat_data.final.independent_pops.ex_low_count_cells <-
+  AddMetaData(
+    object = seurat_data.final.independent_pops.ex_low_count_cells,
+    metadata = percent.mito.tmp,
+    col.name = "percent.mito")
+# VlnPlot(
+#   object = seurat_data.final.independent_pops.ex_low_count_cells,
+#   features.plot = c("nGene", "nUMI", "percent.mito"), nCol = 3)
+
+# filter cells to exclude those with high % mito reads and/or high UMIs
+seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells <-
+  FilterCells(
+    seurat_data.final.independent_pops.ex_low_count_cells,
+    subset.names=c("percent.mito", "nGene", "nUMI"),
+    high.thresholds=c(0.1, 1800, 6500))
+# cuts to 973 cells
+
+# normalize data using simple logNormalize
+seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells <-
+  NormalizeData(
+    object = seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells,
+    normalization.method = "LogNormalize")
+
+# find variable genes
+seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells <-
+  FindVariableGenes(
+    object = seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells,
+    mean.function = ExpMean,
+    dispersion.function = LogVMR,
+    x.low.cutoff = 0.1,
+    x.high.cutoff = 8,
+    y.cutoff = 0.5,
+    do.plot=FALSE)
+# how many variable genes
+length(seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells@var.genes)
+# 1382 variable genes with the cutoffs above
+
+# scale data, and regress out nUMI and percent.mito
+seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells <-
+  ScaleData(
+    object = seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells,
+    vars.to.regress = c("nUMI", "percent.mito"))
+
+## calculate gene set summaries, and store them in annotation
+gene_set_summaries.final.independent_pops.ex_low_count_cells.ex_outlier_cells <-
+  data.frame(
+    row.names=colnames(seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells@scale.data))
+
+# use seurat_scaled data
+for (i in names(gene_sets_list)) {
+  gene_set_summaries.final.independent_pops.ex_low_count_cells.ex_outlier_cells[
+    ,paste("mean", i, "seurat_scaled", sep=".")] <-
+    gene_set_count_summary(
+      counts=seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells@scale.data,
+      gene_set=gene_sets_list[[i]]$ensgene,
+      summary_function=mean,
+      remove_low_count_genes=FALSE)
+}
+
+seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells <-
+  AddMetaData(
+    seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells,
+    gene_set_summaries.final.independent_pops.ex_low_count_cells.ex_outlier_cells)
+```
+
+```{r differential_expression_independent_populations}
+# set identity to cell population
+seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells <-
+  SetAllIdent(
+    seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells,
+    id="library_id")
+
+# determine marker genes for each cell population
+seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells.all_markers <-
+  FindAllMarkers(
+    object = seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells, 
+    only.pos = TRUE,
+    min.pct = 0.25, # defines minimum fraction of cells expressing a given gene
+    logfc.threshold = 0.25, # log-FC
+    return.thresh = 0.01, # Only return markers that have a p-value < 0.01
+    test.use = 'MAST',
+    latent.vars = 'nUMI') # nUMI as proxy for CDR
+```
+
+```{r DE_marker_gene_heatmap, results="hide"}
+# set significance threshold for gene inclusion, and determine genes to use
+q.tmp <- 0.01
+genes_use.tmp <-
+  seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells.all_markers$gene[
+    seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells.all_markers$p_val_adj < q.tmp]
+
+# plot heatmap
+
+DoHeatmap(
+  object = seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells,
+  genes.use = genes_use.tmp,
+  slim.col.label = TRUE, 
+  group.label.rot=FALSE,
+  remove.key = TRUE, cex.row=0, cex.col=2)
+
+# output heatmap to file
+pdf(
+  paste0("heatmap.marker_genes.independent_pops.ex_low_count_cells.ex_outlier_cells.q_", q.tmp, ".pdf"),
+  w=9, h=7)
+DoHeatmap(
+  object = seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells,
+  genes.use = genes_use.tmp,
+  slim.col.label = TRUE, 
+  group.label.rot=FALSE,
+  remove.key = TRUE, cex.row=0, cex.col=2)
+dev.off()
+```
+
+
+Co-expression of Th17 genes and Farber lab core Trm signature genes
+----
+Given the signature of Th17 genes in the bulk RNA-seq data, we want to check for co-expression of genes related to Th17 cells and Trm cells. We will do this by simply plotting the mean expression of each set of genes in each cell. To remove normalization noise around 0, we calculate the mean value after setting the post-normalization counts to 0 for all cells/genes that had 0 values of raw UMI counts.
+
+```{r gene_set_coexpression_by_pop, results="hide"}
+### co-expression scatterplots of gene set expression, colored by population, after thresholding 0s
+
+# define pair of gene sets to test for co-expression
+gene_set_pair <-
+  c("farber_core_Trm.up.seurat_scaled", "Th17.seurat_scaled")
+
+### force the 0s to look like true 0s in the mean gene set expression
+# make a new matrix, and set values that are 0 in the raw data to 0 in the scaled data
+seurat_data.final.thresholded_0.tmp <-
+  seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells
+seurat_data.final.thresholded_0.tmp@scale.data[
+  seurat_data.final.thresholded_0.tmp@raw.data[
+    match(rownames(seurat_data.final.thresholded_0.tmp@scale.data),
+          rownames(seurat_data.final.thresholded_0.tmp@raw.data)),
+    match(colnames(seurat_data.final.thresholded_0.tmp@scale.data),
+          colnames(seurat_data.final.thresholded_0.tmp@raw.data))] == 0] <-
+  0
+
+# recalculate mean gene sets
+gene_set_summaries.scale_data.thresholded_0.tmp <-
+  data.frame(
+    row.names=colnames(seurat_data.final.thresholded_0.tmp@scale.data))
+
+for (i in names(gene_sets_list)) {
+  gene_set_summaries.scale_data.thresholded_0.tmp[
+    ,paste("mean", i, "seurat_scaled", sep=".")] <-
+    gene_set_count_summary(
+      counts=seurat_data.final.thresholded_0.tmp@scale.data,
+      gene_set=gene_sets_list[[i]]$ensgene,
+      summary_function=mean,
+      remove_low_count_genes=FALSE)
+}
+
+seurat_data.final.thresholded_0.tmp <-
+  AddMetaData(
+    seurat_data.final.thresholded_0.tmp,
+    gene_set_summaries.scale_data.thresholded_0.tmp)
+
+## now plot the co-expression of the gene sets
+
+# single plot of all populations, colored by population
+
+ggplot(
+  mapping=aes(
+    x=seurat_data.final.thresholded_0.tmp@meta.data[
+      , paste0("mean.", gene_set_pair[1])],
+    y=seurat_data.final.thresholded_0.tmp@meta.data[
+      , paste0("mean.", gene_set_pair[2])],
+    color=seurat_data.final.thresholded_0.tmp@meta.data$library_id)) +
+  geom_point(size=2, alpha=0.8) +
+  labs(x='Trm core signature "up" genes\n(mean expression)',
+           y='Th17 gene set\n(mean expression)') +
+  scale_color_manual(
+    "Sample",
+    values=pal.independent_pops,
+    labels=pop_labels) +
+  theme(legend.text=element_text(size=rel(0.6)))
+
+# output plot to file
+pdf(paste0(
+  "scatterplot.mean_threshold_0.",
+  gene_set_pair[2], "_vs_mean_threshold_0.", gene_set_pair[1],
+  ".seurat_data.final.independent_pops.ex_low_count_cells.ex_outlier_cells.pdf"),
+  w=8.2, h=6)
+ggplot(
+  mapping=aes(
+    x=seurat_data.final.thresholded_0.tmp@meta.data[
+      , paste0("mean.", gene_set_pair[1])],
+    y=seurat_data.final.thresholded_0.tmp@meta.data[
+      , paste0("mean.", gene_set_pair[2])],
+    color=seurat_data.final.thresholded_0.tmp@meta.data$library_id)) +
+  geom_point(size=2, alpha=0.8) +
+  labs(x='Trm core signature "up" genes\n(mean expression)',
+           y='Th17 gene set\n(mean expression)') +
+  scale_color_manual(
+    "Sample",
+    values=pal.independent_pops,
+    labels=pop_labels) +
+  theme(legend.text=element_text(size=rel(0.6)))
+dev.off()
+```
+
+```{r gene_set_coexpression_separate_plots, fig.width=5, results="hide"}
+## separate plots of each population, for farber_core_Trm.up.seurat_scaled vs. Th17.seurat_scaled
+
+# loop over populations, plotting
+for (j in unique(seurat_data.final.thresholded_0.tmp@meta.data$library_id)) {
+  seurat_data.final.tmp <-
+    FilterCells(
+      seurat_data.final.thresholded_0.tmp,
+      subset.names="nGene",
+      cells.use=
+        seurat_data.final.thresholded_0.tmp@cell.names[
+          seurat_data.final.thresholded_0.tmp@meta.data$library_id == j])
+  
+  print(
+    ggplot(
+      mapping=aes(
+        x=seurat_data.final.tmp@meta.data[
+          , paste0("mean.", gene_set_pair[1])],
+        y=seurat_data.final.tmp@meta.data[
+          , paste0("mean.", gene_set_pair[2])],
+        color=seurat_data.final.tmp@meta.data$library_id)) +
+      geom_point(size=3, alpha=0.8) +
+      labs(x='Trm core signature "up" genes\n(mean expression)',
+           y='Th17 gene set\n(mean expression)',
+           title=pop_labels[j]) +
+      lims(
+        x=range(
+          seurat_data.final.thresholded_0.tmp@meta.data[
+            , paste0("mean.", gene_set_pair[1])]),
+        y=range(
+          seurat_data.final.thresholded_0.tmp@meta.data[
+            , paste0("mean.", gene_set_pair[2])])) +
+      scale_color_manual(
+        "Sample",
+        values=pal.independent_pops,
+        labels=pop_labels) +
+      guides(color=FALSE) +
+      theme(legend.text=element_text(size=rel(0.6))))
+  
+  # output plot to pdf file
+  pdf(paste0(
+    "scatterplot.mean_threshold_0.",
+    gene_set_pair[2], "_vs_mean_threshold_0.", gene_set_pair[1],
+    ".seurat_data.final.ex_low_count_cells.ex_outlier_cells.ex_redundant_pops.",
+    j, ".pdf"),
+    w=6, h=6)
+  print(
+    ggplot(
+      mapping=aes(
+        x=seurat_data.final.tmp@meta.data[
+          , paste0("mean.", gene_set_pair[1])],
+        y=seurat_data.final.tmp@meta.data[
+          , paste0("mean.", gene_set_pair[2])],
+        color=seurat_data.final.tmp@meta.data$library_id)) +
+      geom_point(size=3, alpha=0.8) +
+      labs(x='Trm core signature "up" genes\n(mean expression)',
+           y='Th17 gene set\n(mean expression)',
+           title=pop_labels[j]) +
+      lims(
+        x=range(
+          seurat_data.final.thresholded_0.tmp@meta.data[
+            , paste0("mean.", gene_set_pair[1])]),
+        y=range(
+          seurat_data.final.thresholded_0.tmp@meta.data[
+            , paste0("mean.", gene_set_pair[2])])) +
+      scale_color_manual(
+        "Sample",
+        values=pal.independent_pops,
+        labels=pop_labels) +
+      guides(color=FALSE) +
+      theme(legend.text=element_text(size=rel(0.6))))
+  dev.off()
+}
+```
+
+There do appear to be a small number of cells, almost exclusively in the CCR5+ CD69+ cells from oral mucosa, that express genes typical of Th17 cells and genes typical of Trm cells.
+
+One possible explanation for this is that the dual-expressing cells are actually multiple cells captured in a single droplet. If this were the case, we would expect those cells to have an unusally high number of transcripts, as the RNA-seq libraries would be derived from the pooled transcripts from multiple cells. The plot below shows that this is not the case.
+
+```{r gene_coexpression_colored_by_total_UMIs, results="hide"}
+## plots of all populations colored by UMIs
+
+ggplot(
+  mapping=aes(
+    x=seurat_data.final.thresholded_0.tmp@meta.data[
+      , paste0("mean.", gene_set_pair[1])],
+    y=seurat_data.final.thresholded_0.tmp@meta.data[
+      , paste0("mean.", gene_set_pair[2])],
+    color=seurat_data.final.thresholded_0.tmp@meta.data$nUMI)) +
+  geom_point(size=2, alpha=0.8) +
+  labs(x='Trm core signature "up" genes\n(mean expression)',
+       y='Th17 gene set\n(mean expression)') +
+  scale_color_gradient2(
+    "# mRNA\nmolecules\nDetected",
+    low="blue", mid="gray70", high="red",
+    midpoint=median(range(seurat_data.final.thresholded_0.tmp@meta.data$nUMI))) +
+  theme(legend.text=element_text(size=rel(0.6)))
+
+# output plot to file
+pdf(paste0(
+  "scatterplot.mean_threshold_0.",
+  gene_set_pair[2], "_vs_mean_threshold_0.", gene_set_pair[1],
+  ".seurat_data.final.ex_low_count_cells.ex_outlier_cells.ex_redundant_pops.colored_by_nUMI.pdf"),
+  w=7.8, h=6)
+ggplot(
+  mapping=aes(
+    x=seurat_data.final.thresholded_0.tmp@meta.data[
+      , paste0("mean.", gene_set_pair[1])],
+    y=seurat_data.final.thresholded_0.tmp@meta.data[
+      , paste0("mean.", gene_set_pair[2])],
+    color=seurat_data.final.thresholded_0.tmp@meta.data$nUMI)) +
+  geom_point(size=2, alpha=0.8) +
+  labs(x='Trm core signature "up" genes\n(mean expression)',
+       y='Th17 gene set\n(mean expression)') +
+  scale_color_gradient2(
+    "# mRNA\nmolecules\nDetected",
+    low="blue", mid="gray70", high="red",
+    midpoint=median(range(seurat_data.final.thresholded_0.tmp@meta.data$nUMI))) +
+  theme(legend.text=element_text(size=rel(0.6)))
+dev.off()
+
+```
